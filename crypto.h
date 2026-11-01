@@ -54,7 +54,8 @@ struct session {
     EVP_CIPHER_CTX *dec;
     EVP_MAC        *mac;                 /* HMAC provider */
     uint8_t         nonce_master[32];
-    uint8_t         confirm[CONFIRM_LEN]; /* expected handshake confirmation value */
+    uint8_t         confirm[CONFIRM_LEN];      /* handshake value we send */
+    uint8_t         confirm_peer[CONFIRM_LEN]; /* handshake value we expect */
     int             ready;
 };
 
@@ -65,8 +66,9 @@ int  handshake_init(struct handshake *hs);
 void handshake_free(struct handshake *hs);
 
 /* Combine our key with the peer's public value and the PSK into a session.
- * Fills s (including s->confirm, the value to send and to check against the
- * peer's). Returns 0 on success. */
+ * Fills s (including s->confirm, the value to send, and s->confirm_peer, the
+ * value to expect). Returns 0 on success, -1 on failure or if peer_pub is our
+ * own public value. */
 int  session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN],
                     const uint8_t psk[PSK_LEN], struct session *s);
 void session_free(struct session *s);

@@ -159,6 +159,10 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
     memset(s, 0, sizeof *s);
     s->mac = g_hmac;
 
+    /* Our own public value coming back is a reflection, never a real peer. */
+    if (memcmp(hs->pub, peer_pub, DH_PUB_LEN) == 0)
+        return -1;
+
     EVP_PKEY *peer = dh_import_peer(peer_pub, DH_PUB_LEN);
     if (!peer)
         return -1;
@@ -176,8 +180,10 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
 
     /* Transcript: the two public keys in a fixed order, so both devices hash
      * the same thing regardless of who is "first". */
-    uint8_t transcript[2 * DH_PUB_LEN];
-    if (memcmp(hs->pub, peer_pub, DH_PUB_LEN) <= 0) {
+    uint8_t msg[1 + 2 * DH_PUB_LEN];
+    uint8_t *transcript = msg + 1;
+    int we_are_low = memcmp(hs->pub, peer_pub, DH_PUB_LEN) < 0;
+    if (we_are_low) {
         memcpy(transcript, hs->pub, DH_PUB_LEN);
         memcpy(transcript + DH_PUB_LEN, peer_pub, DH_PUB_LEN);
     } else {
@@ -187,7 +193,7 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
 
     /* Key schedule: the DH secret is the input, the PSK is the salt, so both
      * the shared secret AND knowledge of the PSK are required. */
-    uint8_t okm[AES_KEY_LEN + 32];
+    uint8_t okm[AES_KEY_LEN + 32 + 32];
     if (hkdf(z, zlen, psk, PSK_LEN, "staffsec/v1 keys", okm, sizeof okm) != 0) {
         OPENSSL_cleanse(z, sizeof z);
         return -1;
@@ -197,13 +203,21 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
     s->enc = gcm_ctx(okm, 1);
     s->dec = gcm_ctx(okm + 0, 0);
     memcpy(s->nonce_master, okm + AES_KEY_LEN, 32);
-    OPENSSL_cleanse(okm, sizeof okm);
-    if (!s->enc || !s->dec)
+    if (!s->enc || !s->dec) {
+        OPENSSL_cleanse(okm, sizeof okm);
         return -1;
+    }
 
-    /* Confirmation value both sides can compute and must agree on. Depends on
-     * the PSK and the transcript, so any substituted public key is detected. */
-    if (hmac_sha256(psk, PSK_LEN, transcript, sizeof transcript, s->confirm) != 0)
+    /* One confirmation value per role, keyed from the DH secret and the PSK and
+     * covering the transcript. A substituted public key is detected, and a
+     * device's own value echoed back to it does not match what it expects. */
+    const uint8_t *confirm_key = okm + AES_KEY_LEN + 32;
+    msg[0] = we_are_low ? 'L' : 'H';
+    int rc = hmac_sha256(confirm_key, 32, msg, sizeof msg, s->confirm);
+    msg[0] = we_are_low ? 'H' : 'L';
+    rc |= hmac_sha256(confirm_key, 32, msg, sizeof msg, s->confirm_peer);
+    OPENSSL_cleanse(okm, sizeof okm);
+    if (rc != 0)
         return -1;
 
     s->ready = 1;

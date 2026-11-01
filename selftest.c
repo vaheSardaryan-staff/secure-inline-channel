@@ -20,7 +20,9 @@ int main(void)
     struct session sa, sb;
     CHECK(session_derive(&a, b.pub, psk, &sa) == 0, "derive A");
     CHECK(session_derive(&b, a.pub, psk, &sb) == 0, "derive B");
-    CHECK(memcmp(sa.confirm, sb.confirm, CONFIRM_LEN) == 0, "confirmation values match");
+    CHECK(memcmp(sa.confirm, sb.confirm_peer, CONFIRM_LEN) == 0, "A's confirm is what B expects");
+    CHECK(memcmp(sb.confirm, sa.confirm_peer, CONFIRM_LEN) == 0, "B's confirm is what A expects");
+    CHECK(memcmp(sa.confirm, sa.confirm_peer, CONFIRM_LEN) != 0, "own confirm is not accepted back");
     CHECK(memcmp(sa.nonce_master, sb.nonce_master, 32) == 0, "nonce master matches");
 
     /* A different PSK must yield a different confirmation (auth works). */
@@ -28,6 +30,11 @@ int main(void)
     uint8_t psk2[PSK_LEN]; memset(psk2, 0x11, sizeof psk2);
     CHECK(session_derive(&a, b.pub, psk2, &sc) == 0, "derive with wrong PSK");
     CHECK(memcmp(sa.confirm, sc.confirm, CONFIRM_LEN) != 0, "wrong PSK -> different confirm");
+
+    /* Our own public value offered as the peer's must be refused. */
+    struct session sr;
+    CHECK(session_derive(&a, a.pub, psk, &sr) != 0, "own public key refused");
+    session_free(&sr);
 
     /* Round trip: A seals, B opens, plaintext restored. */
     struct flowid f; memset(&f, 0, sizeof f);

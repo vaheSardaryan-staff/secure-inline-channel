@@ -68,7 +68,7 @@
 #define HS_HELLO         1        /* body: DH public value (DH_PUB_LEN) */
 #define HS_CONFIRM       2        /* body: CONFIRM_LEN-byte confirmation */
 #define HS_RESEND_MS     150
-#define HS_MAX_TRIES     100
+#define HS_WARN_TRIES    100
 #define MAX_FRAME        65536
 #define BUF_SIZE         (MAX_FRAME + GCM_TAG_LEN)
 #define RX_BUDGET        256
@@ -255,6 +255,8 @@ static void hs_derive_if_possible(struct device *d)
         return;
     if (session_derive(&d->hs, d->peer_pub, d->psk, &d->sess) != 0) {
         fprintf(stderr, "device: session derivation failed\n");
+        session_free(&d->sess);
+        d->have_peer_pub = 0;            /* wait for a usable HELLO */
         return;
     }
     d->sess.ready = 0;   /* keys exist; forward only after the peer confirms */
@@ -275,11 +277,9 @@ static void hs_retry(struct device *d)
 {
     if (d->sess.ready || ms_since(&d->last_send) < HS_RESEND_MS)
         return;
-    if (++d->tries > HS_MAX_TRIES) {
-        if (d->tries == HS_MAX_TRIES + 1)
-            fprintf(stderr, "device: handshake not completing - peer down or PSK mismatch?\n");
-        return;
-    }
+    /* Keep going after the warning: the peer may simply start later. */
+    if (++d->tries == HS_WARN_TRIES)
+        fprintf(stderr, "device: handshake not completing yet - peer down or PSK mismatch?\n");
     hs_send_stage(d);
 }
 
@@ -294,7 +294,14 @@ static void hs_handle(struct device *d, const uint8_t *f, size_t len)
     if (ETH_HLEN_ + 4 + blen > len) return;
 
     if (type == HS_HELLO && blen == DH_PUB_LEN) {
-        if (!d->have_peer_pub) {
+        /* Until the session is confirmed the newest HELLO wins, so a bogus one
+         * or a restarted peer cannot lock us out for the rest of the run. */
+        if (!d->sess.ready
+            && (!d->have_peer_pub || memcmp(d->peer_pub, body, DH_PUB_LEN) != 0)) {
+            if (d->derived) {
+                session_free(&d->sess);
+                d->derived = 0;
+            }
             memcpy(d->peer_pub, body, DH_PUB_LEN);
             d->have_peer_pub = 1;
             hs_derive_if_possible(d);
@@ -302,18 +309,17 @@ static void hs_handle(struct device *d, const uint8_t *f, size_t len)
         if (d->derived)                      /* peer may still need our CONFIRM */
             hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);
     } else if (type == HS_CONFIRM && blen == CONFIRM_LEN) {
-        hs_derive_if_possible(d);             /* in case their HELLO was lost */
         if (d->derived && !d->sess.ready) {
-            if (CRYPTO_memcmp(body, d->sess.confirm, CONFIRM_LEN) == 0) {
+            if (CRYPTO_memcmp(body, d->sess.confirm_peer, CONFIRM_LEN) == 0) {
                 d->sess.ready = 1;
-                hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);  /* help peer finish */
+                /* Answer once, on this transition only. Replying to every
+                 * CONFIRM would make two ready devices bounce frames forever. */
+                hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);
                 fprintf(stderr, "device: secure session established (ephemeral DH, AES-256-GCM)\n");
             } else {
                 fprintf(stderr, "device: handshake confirmation MISMATCH - "
                                 "wrong PSK or tampered exchange, refusing to forward\n");
             }
-        } else if (d->sess.ready) {
-            hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);      /* peer catching up */
         }
     }
 }
