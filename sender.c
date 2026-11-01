@@ -66,8 +66,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Keep each TCP segment small enough that the device can add its 28-byte
-     * trailer (12 IV + 16 GCM tag) without going over the 1500-byte MTU.
+    /* Keep each TCP segment small enough that the device can add its 16-byte
+     * GCM tag without going over the 1500-byte MTU.
      * Must be set before connect() so it goes into the SYN. */
     int mss = XFR_TCP_MSS;
     if (setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof mss) < 0)

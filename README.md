@@ -7,8 +7,8 @@ only thing added on the wire is the 16-byte GCM tag.
 
 ```
 pc1 ----- d1 ----- mitm(bridge) ----- d2 ----- pc2
-10.10.10.1  encrypt   can't read        decrypt   10.20.20.2
-./sender  payload   or alter it       payload   ./receiver
+10.10.10.1  encrypt   sees only         decrypt   10.20.20.2
+./sender  payload   ciphertext        payload   ./receiver
           (no IP)                     (no IP)
 ```
 
@@ -47,17 +47,20 @@ AES-GCM needs a nonce that never repeats under one key. Instead of sending a
 already see:
 
 ```
-nonce = HMAC-SHA256(nonce_master, "N" | flow | seq | len)[0..12]
-aad   =                           "A" | flow | seq          (authenticated)
+nonce = HMAC-SHA256(nonce_master, "N" | flow | isn | seq64 | len)[0..12]
+aad   =                           "A" | flow | isn | seq64    (authenticated)
 ```
 
 - `flow` is the connection's 4-tuple in a canonical order plus a direction bit,
   identical on both devices.
-- `seq` is the TCP sequence number; `len` is the payload length (the receiver
+- `isn` is the direction's initial sequence number, learned from its SYN, so a
+  new connection on the same 4-tuple gets different nonces.
+- `seq64` is the TCP sequence number extended to 64 bits, so it does not repeat
+  when the 32-bit field wraps; `len` is the payload length (the receiver
   gets it from `ciphertext length = received length - 16`).
 
-Two different plaintexts can never share the same `(flow, seq, len)`, so the
-nonce is unique for every packet. A genuine TCP retransmission of the same bytes
+For TCP traffic `(flow, isn, seq64, len)` names one position in one byte stream,
+so the nonce differs for every distinct packet. A genuine TCP retransmission of the same bytes
 reproduces the same nonce and therefore the same ciphertext, which is safe. The
 AAD binds each payload to its connection and stream position, so a valid
 encrypted payload can't be replayed into another flow or offset.
@@ -74,7 +77,7 @@ encrypted payload can't be replayed into another flow or offset.
 | `mitm_attack.py` | active attacker demo (tamper is rejected) |
 | `selftest.c` | unit checks for the crypto module (`make test`) |
 
-Requirements (Ubuntu/Debian): `sudo apt install build-essential libssl-dev iproute2 ethtool tcpdump`
+Requirements (Ubuntu/Debian): `sudo apt install build-essential libssl-dev iproute2 ethtool tcpdump bc python3 openssl` (OpenSSL 3.0 or newer)
 
 ## Quick start
 
@@ -153,9 +156,14 @@ still arrives intact.
 
 ## Known limits (prototype)
 
-- Only IPv4 TCP payload is protected; ARP/ICMP/IPv6 pass in clear.
-- The nonce uses the 32-bit TCP sequence number; a single connection moving more
-  than ~4 GiB would wrap it. Out of scope for this prototype; a production
-  version would add an explicit epoch counter.
+- Only IPv4 TCP payload is protected; ARP, ICMP, UDP, IPv6 and VLAN-tagged frames
+  pass in clear. Fragmented or malformed IPv4 TCP is dropped.
+- TCP headers are only partly authenticated (4-tuple and sequence number), and
+  payload-free TCP such as RST is not authenticated, so an attacker on the wire
+  can disrupt a connection, including with a forged SYN. It cannot read or forge
+  payload.
+- A retransmission reuses its nonce with identical bytes. A host on the plain
+  side crafting different bytes at the same position would also repeat a nonce.
+- If one device restarts after the session is up, restart both.
 - One pre-shared key authenticates the handshake. Replacing the PSK with
   certificates would remove the shared-secret requirement.
