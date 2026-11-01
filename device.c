@@ -150,21 +150,24 @@ struct pkt {
     uint8_t *payload; size_t plen;
 };
 
+/* Returns 1 for a usable IPv4/TCP packet, 0 for other traffic, and -1 for IPv4
+ * TCP we cannot protect (fragments, bad lengths), which must never pass as is:
+ * a host would reassemble it without any tag having been checked. */
 static int parse_ipv4_tcp(uint8_t *f, size_t len, struct pkt *p)
 {
     if (len < ETH_HLEN_ + IP_MIN_HLEN) return 0;
     if (get16(f + 12) != ETH_P_IP) return 0;
     uint8_t *ip = f + ETH_HLEN_;
     if ((ip[0] >> 4) != 4) return 0;
+    if (ip[9] != IPPROTO_TCP) return 0;
     size_t ihl = (size_t)(ip[0] & 0x0F) * 4;
     size_t tot = get16(ip + 2);
-    if (ihl < IP_MIN_HLEN || tot < ihl || ETH_HLEN_ + tot > len) return 0;
-    if (ip[9] != IPPROTO_TCP) return 0;
-    if (get16(ip + 6) & 0x3FFF) return 0;              /* fragmented */
+    if (ihl < IP_MIN_HLEN || tot < ihl || ETH_HLEN_ + tot > len) return -1;
+    if (get16(ip + 6) & 0x3FFF) return -1;             /* fragmented */
     uint8_t *tcp = ip + ihl;
-    if (tot - ihl < TCP_MIN_HLEN) return 0;
+    if (tot - ihl < TCP_MIN_HLEN) return -1;
     size_t thl = (size_t)(tcp[12] >> 4) * 4;
-    if (thl < TCP_MIN_HLEN || ihl + thl > tot) return 0;
+    if (thl < TCP_MIN_HLEN || ihl + thl > tot) return -1;
     p->ip = ip; p->ihl = ihl; p->tot_len = tot;
     p->tcp = tcp; p->thl = thl;
     p->payload = tcp + thl; p->plen = tot - ihl - thl;
@@ -378,7 +381,12 @@ static enum verdict do_decrypt(struct device *d, struct pkt *p)
 static enum verdict process(struct device *d, uint8_t *frame, size_t *len, int from_plain)
 {
     struct pkt p;
-    if (!parse_ipv4_tcp(frame, *len, &p)) {
+    int parsed = parse_ipv4_tcp(frame, *len, &p);
+    if (parsed < 0) {
+        d->st.drop_bad_format++;              /* fragment or malformed TCP */
+        return DROP;
+    }
+    if (parsed == 0) {
         d->st.passthrough++;                  /* ARP, ICMP, IPv6... */
         return FORWARD;
     }
