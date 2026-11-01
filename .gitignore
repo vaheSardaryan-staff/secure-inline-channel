@@ -1,0 +1,11 @@
+# secrets - never commit
+psk.hex
+key.hex
+# build artifacts
+sender
+receiver
+device
+selftest
+*.o
+*.part
+*.pcap

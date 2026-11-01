@@ -17,7 +17,7 @@ device: device.c crypto.c crypto.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ device.c crypto.c $(CRYPTO_LIBS)
 
 clean:
-	rm -f sender receiver device
+	rm -f sender receiver device selftest
 
 .PHONY: all clean
 
