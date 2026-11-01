@@ -7,8 +7,8 @@ only thing added on the wire is the 16-byte GCM tag.
 
 ```
 pc1 ----- d1 ----- mitm(bridge) ----- d2 ----- pc2
-10.10.10.1  encrypt   can't read        decrypt   10.20.20.2
-./sender  payload   or alter it       payload   ./receiver
+10.10.10.1  encrypt   sees only         decrypt   10.20.20.2
+./sender  payload   ciphertext        payload   ./receiver
           (no IP)                     (no IP)
 ```
 
@@ -47,17 +47,20 @@ AES-GCM needs a nonce that never repeats under one key. Instead of sending a
 already see:
 
 ```
-nonce = HMAC-SHA256(nonce_master, "N" | flow | seq | len)[0..12]
-aad   =                           "A" | flow | seq          (authenticated)
+nonce = HMAC-SHA256(nonce_master, "N" | flow | isn | seq64 | len)[0..12]
+aad   =                           "A" | flow | isn | seq64    (authenticated)
 ```
 
 - `flow` is the connection's 4-tuple in a canonical order plus a direction bit,
   identical on both devices.
-- `seq` is the TCP sequence number; `len` is the payload length (the receiver
+- `isn` is the direction's initial sequence number, learned from its SYN, so a
+  new connection on the same 4-tuple gets different nonces.
+- `seq64` is the TCP sequence number extended to 64 bits, so it does not repeat
+  when the 32-bit field wraps; `len` is the payload length (the receiver
   gets it from `ciphertext length = received length - 16`).
 
-Two different plaintexts can never share the same `(flow, seq, len)`, so the
-nonce is unique for every packet. A genuine TCP retransmission of the same bytes
+For TCP traffic `(flow, isn, seq64, len)` names one position in one byte stream,
+so the nonce differs for every distinct packet. A genuine TCP retransmission of the same bytes
 reproduces the same nonce and therefore the same ciphertext, which is safe. The
 AAD binds each payload to its connection and stream position, so a valid
 encrypted payload can't be replayed into another flow or offset.
@@ -74,7 +77,7 @@ encrypted payload can't be replayed into another flow or offset.
 | `mitm_attack.py` | active attacker demo (tamper is rejected) |
 | `selftest.c` | unit checks for the crypto module (`make test`) |
 
-Requirements (Ubuntu/Debian): `sudo apt install build-essential libssl-dev iproute2 ethtool tcpdump`
+Requirements (Ubuntu/Debian): `sudo apt install build-essential libssl-dev iproute2 ethtool tcpdump bc python3 openssl` (OpenSSL 3.0 or newer)
 
 ## Quick start
 
@@ -140,6 +143,91 @@ still arrives intact.
   traffic only; it is never forwarded to the PCs, and the data path carries no
   extra header.
 
+## Testing in Docker on macOS
+
+The lab depends on Linux network namespaces, veth pairs and `AF_PACKET` raw
+sockets, so it can't run directly on macOS. I tested it on a Mac inside an
+Ubuntu 24.04 container using Docker Desktop.
+
+### Start the container
+
+Run this from the project folder on the Mac:
+
+```bash
+docker run -it --name lab --privileged -v "$PWD":/lab -w /lab ubuntu:24.04 bash
+```
+
+- `--privileged` lets the container create namespaces and network interfaces.
+- `-v "$PWD":/lab` makes the project files available at `/lab`.
+- The container shell runs as root, so the commands below don't need `sudo`.
+
+### Build the lab
+
+Run these inside the container:
+
+```bash
+apt update
+apt install -y build-essential libssl-dev iproute2 ethtool tcpdump bc python3 openssl
+make
+./setup.sh
+openssl rand -hex 32 > psk.hex
+head -c 20M /dev/urandom > /tmp/file
+```
+
+### Run the transfer
+
+Each role needs its own terminal. Open each one from the Mac with:
+
+```bash
+docker exec -it -w /lab lab bash
+```
+
+Then run one command per terminal, in this order:
+
+```bash
+# Terminal 1: device 1
+ip netns exec d1 ./device d1-pc d1-net psk.hex
+# Terminal 2: device 2
+ip netns exec d2 ./device d2-pc d2-net psk.hex
+# Terminal 3: receiver on pc2
+ip netns exec pc2 ./receiver 5000 /tmp/out
+# Terminal 4: sender on pc1
+ip netns exec pc1 ./sender 10.20.20.2 5000 /tmp/file
+```
+
+When the transfer finishes, compare the two files:
+
+```bash
+sha256sum /tmp/file /tmp/out
+```
+
+### Run the wrong-PSK test
+
+This script builds its own lab, gives device 2 a different PSK, and removes the
+lab when it finishes:
+
+```bash
+WRONGKEY=1 ./run_test.sh
+```
+
+### Results
+
+**Handshake:** both devices established a secure session.
+
+![Device 1 establishes a secure session](docs/screenshots/01-device1-handshake.png)
+
+![Device 2 establishes a secure session](docs/screenshots/02-device2-handshake.png)
+
+**File transfer:** the sender sent 20,971,520 bytes (20 MiB), the receiver
+confirmed them, and the SHA-256 hashes of `/tmp/file` and `/tmp/out` match.
+
+![Sender output and matching SHA-256 hashes](docs/screenshots/03-transfer-sha256.png)
+
+**Wrong PSK:** device 2 reports a handshake confirmation mismatch and refuses to
+forward. Its `encrypted` and `decrypted` counters both stay at 0.
+
+![Docker Desktop logs showing the refused handshake](docs/screenshots/04-wrong-psk-refused.png)
+
 ## Tested in this build
 
 - 20 MB and 100 MB transfers: SHA-256 identical, 0 drops (~1 s for 100 MB).
@@ -153,9 +241,14 @@ still arrives intact.
 
 ## Known limits (prototype)
 
-- Only IPv4 TCP payload is protected; ARP/ICMP/IPv6 pass in clear.
-- The nonce uses the 32-bit TCP sequence number; a single connection moving more
-  than ~4 GiB would wrap it. Out of scope for this prototype; a production
-  version would add an explicit epoch counter.
+- Only IPv4 TCP payload is protected; ARP, ICMP, UDP, IPv6 and VLAN-tagged frames
+  pass in clear. Fragmented or malformed IPv4 TCP is dropped.
+- TCP headers are only partly authenticated (4-tuple and sequence number), and
+  payload-free TCP such as RST is not authenticated, so an attacker on the wire
+  can disrupt a connection, including with a forged SYN. It cannot read or forge
+  payload.
+- A retransmission reuses its nonce with identical bytes. A host on the plain
+  side crafting different bytes at the same position would also repeat a nonce.
+- If one device restarts after the session is up, restart both.
 - One pre-shared key authenticates the handshake. Replacing the PSK with
   certificates would remove the shared-secret requirement.
