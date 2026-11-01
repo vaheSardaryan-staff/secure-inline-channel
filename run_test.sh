@@ -30,7 +30,7 @@ PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill -INT "$p" 2>/dev/null || true; done
     for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
-    for l in d1 d2; do [[ -f "$WORK/$l.log" ]] && { echo "--- $l ---"; tail -n 16 "$WORK/$l.log"; }; done
+    for l in d1 d2; do [[ -f "$WORK/$l.log" ]] && { echo "--- $l ---"; tail -n 17 "$WORK/$l.log"; }; done
     [[ "$KEEP" == 1 ]] || ./teardown.sh
     [[ "$WRONGKEY" == 1 ]] && rm -f "$PSK2"
     rm -rf "$WORK"

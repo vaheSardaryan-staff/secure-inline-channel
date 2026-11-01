@@ -68,11 +68,13 @@
 #define HS_HELLO         1        /* body: DH public value (DH_PUB_LEN) */
 #define HS_CONFIRM       2        /* body: CONFIRM_LEN-byte confirmation */
 #define HS_RESEND_MS     150
-#define HS_MAX_TRIES     100
+#define HS_WARN_TRIES    100
 #define MAX_FRAME        65536
 #define BUF_SIZE         (MAX_FRAME + GCM_TAG_LEN)
 #define RX_BUDGET        256
 #define MSS_HEADROOM     76       /* 20 IP + max 40 TCP options + 16 tag */
+#define FLOW_BUCKETS     1024
+#define FLOW_WAYS        4
 
 /* ---- state ------------------------------------------------------------- */
 struct port {
@@ -86,7 +88,7 @@ struct port {
 struct stats {
     unsigned long encrypted, decrypted, passthrough;
     unsigned long fwd_p2c, fwd_c2p, mss_clamped;
-    unsigned long drop_not_ready, drop_auth_fail, drop_bad_format;
+    unsigned long drop_not_ready, drop_auth_fail, drop_bad_format, drop_no_flow;
     unsigned long drop_bad_csum, drop_oversize, drop_send_fail, drop_crypto_err;
 };
 
@@ -150,21 +152,24 @@ struct pkt {
     uint8_t *payload; size_t plen;
 };
 
+/* Returns 1 for a usable IPv4/TCP packet, 0 for other traffic, and -1 for IPv4
+ * TCP we cannot protect (fragments, bad lengths), which must never pass as is:
+ * a host would reassemble it without any tag having been checked. */
 static int parse_ipv4_tcp(uint8_t *f, size_t len, struct pkt *p)
 {
     if (len < ETH_HLEN_ + IP_MIN_HLEN) return 0;
     if (get16(f + 12) != ETH_P_IP) return 0;
     uint8_t *ip = f + ETH_HLEN_;
     if ((ip[0] >> 4) != 4) return 0;
+    if (ip[9] != IPPROTO_TCP) return 0;
     size_t ihl = (size_t)(ip[0] & 0x0F) * 4;
     size_t tot = get16(ip + 2);
-    if (ihl < IP_MIN_HLEN || tot < ihl || ETH_HLEN_ + tot > len) return 0;
-    if (ip[9] != IPPROTO_TCP) return 0;
-    if (get16(ip + 6) & 0x3FFF) return 0;              /* fragmented */
+    if (ihl < IP_MIN_HLEN || tot < ihl || ETH_HLEN_ + tot > len) return -1;
+    if (get16(ip + 6) & 0x3FFF) return -1;             /* fragmented */
     uint8_t *tcp = ip + ihl;
-    if (tot - ihl < TCP_MIN_HLEN) return 0;
+    if (tot - ihl < TCP_MIN_HLEN) return -1;
     size_t thl = (size_t)(tcp[12] >> 4) * 4;
-    if (thl < TCP_MIN_HLEN || ihl + thl > tot) return 0;
+    if (thl < TCP_MIN_HLEN || ihl + thl > tot) return -1;
     p->ip = ip; p->ihl = ihl; p->tot_len = tot;
     p->tcp = tcp; p->thl = thl;
     p->payload = tcp + thl; p->plen = tot - ihl - thl;
@@ -196,6 +201,63 @@ static void flow_of(const struct pkt *p, struct flowid *f)
     } else {
         memcpy(f->canon, b, 6); memcpy(f->canon + 6, a, 6); f->dir = 1;
     }
+}
+
+/* ---- per-flow sequence state ------------------------------------------- */
+/* Both devices learn each direction's ISN from its SYN and track the highest
+ * sequence seen, to extend the 32-bit field to 64 bits for the nonce. */
+struct flow_state {
+    uint8_t canon[12];
+    uint8_t dir;
+    uint8_t used;
+    uint32_t isn;
+    uint64_t high;
+    uint64_t last_used;
+};
+
+static struct flow_state g_flows[FLOW_BUCKETS * FLOW_WAYS];
+static uint64_t g_flow_tick;
+
+static struct flow_state *flow_bucket(const struct flowid *f)
+{
+    uint32_t h = 2166136261u;                 /* FNV-1a */
+    for (size_t i = 0; i < sizeof f->canon; i++)
+        h = (h ^ f->canon[i]) * 16777619u;
+    h = (h ^ f->dir) * 16777619u;
+    return &g_flows[(h % FLOW_BUCKETS) * FLOW_WAYS];
+}
+
+static struct flow_state *flow_find(const struct flowid *f)
+{
+    struct flow_state *b = flow_bucket(f);
+    for (int i = 0; i < FLOW_WAYS; i++)
+        if (b[i].used && b[i].dir == f->dir && memcmp(b[i].canon, f->canon, sizeof f->canon) == 0) {
+            b[i].last_used = ++g_flow_tick;
+            return &b[i];
+        }
+    return NULL;
+}
+
+/* A full bucket evicts its least recently used flow; that flow's later data is
+ * dropped as unknown. */
+static void flow_note_syn(const struct flowid *f, uint32_t isn)
+{
+    struct flow_state *e = flow_find(f);
+    if (e && e->isn == isn)
+        return;
+    if (!e) {
+        struct flow_state *b = flow_bucket(f);
+        e = &b[0];
+        for (int i = 1; i < FLOW_WAYS && e->used; i++)
+            if (!b[i].used || b[i].last_used < e->last_used)
+                e = &b[i];
+        memcpy(e->canon, f->canon, sizeof f->canon);
+        e->dir = f->dir;
+        e->used = 1;
+        e->last_used = ++g_flow_tick;
+    }
+    e->isn = isn;
+    e->high = (1ULL << 32) + isn;             /* offset: extension cannot underflow */
 }
 
 /* Lower the MSS option in SYN packets as a safety net. */
@@ -255,6 +317,8 @@ static void hs_derive_if_possible(struct device *d)
         return;
     if (session_derive(&d->hs, d->peer_pub, d->psk, &d->sess) != 0) {
         fprintf(stderr, "device: session derivation failed\n");
+        session_free(&d->sess);
+        d->have_peer_pub = 0;
         return;
     }
     d->sess.ready = 0;   /* keys exist; forward only after the peer confirms */
@@ -275,11 +339,9 @@ static void hs_retry(struct device *d)
 {
     if (d->sess.ready || ms_since(&d->last_send) < HS_RESEND_MS)
         return;
-    if (++d->tries > HS_MAX_TRIES) {
-        if (d->tries == HS_MAX_TRIES + 1)
-            fprintf(stderr, "device: handshake not completing - peer down or PSK mismatch?\n");
-        return;
-    }
+    /* Keep going after the warning: the peer may simply start later. */
+    if (++d->tries == HS_WARN_TRIES)
+        fprintf(stderr, "device: handshake not completing yet - peer down or PSK mismatch?\n");
     hs_send_stage(d);
 }
 
@@ -294,7 +356,14 @@ static void hs_handle(struct device *d, const uint8_t *f, size_t len)
     if (ETH_HLEN_ + 4 + blen > len) return;
 
     if (type == HS_HELLO && blen == DH_PUB_LEN) {
-        if (!d->have_peer_pub) {
+        /* Until the session is confirmed the newest HELLO wins, so a bogus one
+         * or a restarted peer cannot lock us out for the rest of the run. */
+        if (!d->sess.ready
+            && (!d->have_peer_pub || memcmp(d->peer_pub, body, DH_PUB_LEN) != 0)) {
+            if (d->derived) {
+                session_free(&d->sess);
+                d->derived = 0;
+            }
             memcpy(d->peer_pub, body, DH_PUB_LEN);
             d->have_peer_pub = 1;
             hs_derive_if_possible(d);
@@ -302,18 +371,17 @@ static void hs_handle(struct device *d, const uint8_t *f, size_t len)
         if (d->derived)                      /* peer may still need our CONFIRM */
             hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);
     } else if (type == HS_CONFIRM && blen == CONFIRM_LEN) {
-        hs_derive_if_possible(d);             /* in case their HELLO was lost */
         if (d->derived && !d->sess.ready) {
-            if (CRYPTO_memcmp(body, d->sess.confirm, CONFIRM_LEN) == 0) {
+            if (CRYPTO_memcmp(body, d->sess.confirm_peer, CONFIRM_LEN) == 0) {
                 d->sess.ready = 1;
-                hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);  /* help peer finish */
+                /* Answer once, on this transition only. Replying to every
+                 * CONFIRM would make two ready devices bounce frames forever. */
+                hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);
                 fprintf(stderr, "device: secure session established (ephemeral DH, AES-256-GCM)\n");
             } else {
                 fprintf(stderr, "device: handshake confirmation MISMATCH - "
                                 "wrong PSK or tampered exchange, refusing to forward\n");
             }
-        } else if (d->sess.ready) {
-            hs_send(d, HS_CONFIRM, d->sess.confirm, CONFIRM_LEN);      /* peer catching up */
         }
     }
 }
@@ -332,12 +400,20 @@ static enum verdict do_encrypt(struct device *d, struct pkt *p)
         return DROP;
     }
     struct flowid f; flow_of(p, &f);
-    uint32_t seq = get32(p->tcp + 4);
+    struct flow_state *fs = flow_find(&f);
+    if (!fs) {
+        d->st.drop_no_flow++;
+        return DROP;
+    }
+    f.isn = fs->isn;
+    uint64_t seq = seq_extend(fs->high, get32(p->tcp + 4));
     uint8_t tag[GCM_TAG_LEN];
     if (session_seal(&d->sess, &f, seq, p->payload, p->plen, g_scratch, tag) != 0) {
         d->st.drop_crypto_err++;
         return DROP;
     }
+    if (seq > fs->high)
+        fs->high = seq;
     memcpy(p->payload, g_scratch, p->plen);
     memcpy(p->payload + p->plen, tag, GCM_TAG_LEN);
     p->plen += GCM_TAG_LEN;
@@ -355,13 +431,21 @@ static enum verdict do_decrypt(struct device *d, struct pkt *p)
     size_t clen = p->plen - GCM_TAG_LEN;
     const uint8_t *tag = p->payload + clen;
     struct flowid f; flow_of(p, &f);
-    uint32_t seq = get32(p->tcp + 4);
+    struct flow_state *fs = flow_find(&f);
+    if (!fs) {
+        d->st.drop_no_flow++;
+        return DROP;
+    }
+    f.isn = fs->isn;
+    uint64_t seq = seq_extend(fs->high, get32(p->tcp + 4));
     if (session_open(&d->sess, &f, seq, p->payload, clen, tag, g_scratch) != 0) {
         d->st.drop_auth_fail++;
         if (d->verbose)
             fprintf(stderr, "drop: authentication failed (tampered or wrong key)\n");
         return DROP;
     }
+    if (seq > fs->high)                       /* only authenticated data moves it */
+        fs->high = seq;
     memcpy(p->payload, g_scratch, clen);
     p->plen = clen;
     p->tot_len -= GCM_TAG_LEN;
@@ -372,7 +456,12 @@ static enum verdict do_decrypt(struct device *d, struct pkt *p)
 static enum verdict process(struct device *d, uint8_t *frame, size_t *len, int from_plain)
 {
     struct pkt p;
-    if (!parse_ipv4_tcp(frame, *len, &p)) {
+    int parsed = parse_ipv4_tcp(frame, *len, &p);
+    if (parsed < 0) {
+        d->st.drop_bad_format++;
+        return DROP;
+    }
+    if (parsed == 0) {
         d->st.passthrough++;                  /* ARP, ICMP, IPv6... */
         return FORWARD;
     }
@@ -390,6 +479,11 @@ static enum verdict process(struct device *d, uint8_t *frame, size_t *len, int f
     if (!gcm_protected && !tcp_csum_ok(&p)) {
         d->st.drop_bad_csum++;
         return DROP;
+    }
+
+    if (p.tcp[13] & 0x02) {
+        struct flowid syn; flow_of(&p, &syn);
+        flow_note_syn(&syn, get32(p.tcp + 4));
     }
 
     int modified = 0;
@@ -550,13 +644,14 @@ static void print_stats(const struct device *d)
         "  dropped: session not up : %lu\n"
         "  dropped: auth failed    : %lu\n"
         "  dropped: bad format     : %lu\n"
+        "  dropped: unknown flow   : %lu\n"
         "  dropped: bad checksum   : %lu\n"
         "  dropped: too big        : %lu\n"
         "  dropped: send failed    : %lu\n"
         "  dropped: crypto error   : %lu\n",
         d->plain.name, d->cipher.name, s->fwd_p2c, s->fwd_c2p, s->encrypted, s->decrypted,
         s->passthrough, s->mss_clamped, s->drop_not_ready, s->drop_auth_fail,
-        s->drop_bad_format, s->drop_bad_csum, s->drop_oversize, s->drop_send_fail,
+        s->drop_bad_format, s->drop_no_flow, s->drop_bad_csum, s->drop_oversize, s->drop_send_fail,
         s->drop_crypto_err);
 }
 

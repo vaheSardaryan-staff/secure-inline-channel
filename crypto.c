@@ -15,6 +15,7 @@
 #include <openssl/rand.h>
 
 #define DH_GROUP "ffdhe2048"
+#define AAD_LEN  (1 + 12 + 1 + 4 + 8)
 
 /* ---- small helpers ----------------------------------------------------- */
 static void put_be32(uint8_t *p, uint32_t v)
@@ -23,6 +24,12 @@ static void put_be32(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);
     p[3] = (uint8_t)v;
+}
+
+static void put_be64(uint8_t *p, uint64_t v)
+{
+    put_be32(p, (uint32_t)(v >> 32));
+    put_be32(p + 4, (uint32_t)v);
 }
 
 static EVP_MAC *g_hmac;   /* HMAC provider, fetched once */
@@ -159,6 +166,10 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
     memset(s, 0, sizeof *s);
     s->mac = g_hmac;
 
+    /* Our own public value coming back is a reflection, never a real peer. */
+    if (memcmp(hs->pub, peer_pub, DH_PUB_LEN) == 0)
+        return -1;
+
     EVP_PKEY *peer = dh_import_peer(peer_pub, DH_PUB_LEN);
     if (!peer)
         return -1;
@@ -176,8 +187,10 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
 
     /* Transcript: the two public keys in a fixed order, so both devices hash
      * the same thing regardless of who is "first". */
-    uint8_t transcript[2 * DH_PUB_LEN];
-    if (memcmp(hs->pub, peer_pub, DH_PUB_LEN) <= 0) {
+    uint8_t msg[1 + 2 * DH_PUB_LEN];
+    uint8_t *transcript = msg + 1;
+    int we_are_low = memcmp(hs->pub, peer_pub, DH_PUB_LEN) < 0;
+    if (we_are_low) {
         memcpy(transcript, hs->pub, DH_PUB_LEN);
         memcpy(transcript + DH_PUB_LEN, peer_pub, DH_PUB_LEN);
     } else {
@@ -187,7 +200,7 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
 
     /* Key schedule: the DH secret is the input, the PSK is the salt, so both
      * the shared secret AND knowledge of the PSK are required. */
-    uint8_t okm[AES_KEY_LEN + 32];
+    uint8_t okm[AES_KEY_LEN + 32 + 32];
     if (hkdf(z, zlen, psk, PSK_LEN, "staffsec/v1 keys", okm, sizeof okm) != 0) {
         OPENSSL_cleanse(z, sizeof z);
         return -1;
@@ -197,13 +210,21 @@ int session_derive(const struct handshake *hs, const uint8_t peer_pub[DH_PUB_LEN
     s->enc = gcm_ctx(okm, 1);
     s->dec = gcm_ctx(okm + 0, 0);
     memcpy(s->nonce_master, okm + AES_KEY_LEN, 32);
-    OPENSSL_cleanse(okm, sizeof okm);
-    if (!s->enc || !s->dec)
+    if (!s->enc || !s->dec) {
+        OPENSSL_cleanse(okm, sizeof okm);
         return -1;
+    }
 
-    /* Confirmation value both sides can compute and must agree on. Depends on
-     * the PSK and the transcript, so any substituted public key is detected. */
-    if (hmac_sha256(psk, PSK_LEN, transcript, sizeof transcript, s->confirm) != 0)
+    /* One confirmation value per role, keyed from the DH secret and the PSK and
+     * covering the transcript. A substituted public key is detected, and a
+     * device's own value echoed back to it does not match what it expects. */
+    const uint8_t *confirm_key = okm + AES_KEY_LEN + 32;
+    msg[0] = we_are_low ? 'L' : 'H';
+    int rc = hmac_sha256(confirm_key, 32, msg, sizeof msg, s->confirm);
+    msg[0] = we_are_low ? 'H' : 'L';
+    rc |= hmac_sha256(confirm_key, 32, msg, sizeof msg, s->confirm_peer);
+    OPENSSL_cleanse(okm, sizeof okm);
+    if (rc != 0)
         return -1;
 
     s->ready = 1;
@@ -222,17 +243,23 @@ void session_free(struct session *s)
 }
 
 /* ---- per-packet nonce and AAD ----------------------------------------- */
-/* nonce = HMAC(nonce_master, 'N' | flow | seq | len)[0..12]
- * Unique because (flow, seq, len) is unique to each distinct plaintext. */
-static int derive_nonce(struct session *s, const struct flowid *f,
-                        uint32_t seq, uint32_t len, uint8_t nonce[GCM_NONCE_LEN])
+uint64_t seq_extend(uint64_t high, uint32_t seq)
 {
-    uint8_t msg[1 + sizeof f->canon + 1 + 4 + 4];
+    int32_t delta = (int32_t)(seq - (uint32_t)high);
+    return high + (uint64_t)(int64_t)delta;
+}
+
+/* nonce = HMAC(nonce_master, 'N' | flow | isn | seq64 | len)[0..12] */
+static int derive_nonce(struct session *s, const struct flowid *f,
+                        uint64_t seq, uint32_t len, uint8_t nonce[GCM_NONCE_LEN])
+{
+    uint8_t msg[1 + sizeof f->canon + 1 + 4 + 8 + 4];
     size_t n = 0;
     msg[n++] = 'N';
     memcpy(msg + n, f->canon, sizeof f->canon); n += sizeof f->canon;
     msg[n++] = f->dir;
-    put_be32(msg + n, seq); n += 4;
+    put_be32(msg + n, f->isn); n += 4;
+    put_be64(msg + n, seq); n += 8;
     put_be32(msg + n, len); n += 4;
 
     uint8_t full[32];
@@ -242,22 +269,24 @@ static int derive_nonce(struct session *s, const struct flowid *f,
     return 0;
 }
 
-/* aad = 'A' | flow | seq : binds the ciphertext to its connection and stream
- * position, so a valid payload cannot be replayed into another flow/offset. */
-static size_t build_aad(const struct flowid *f, uint32_t seq, uint8_t *aad)
+/* aad = 'A' | flow | isn | seq64 : binds the ciphertext to its connection and
+ * stream position, so a valid payload cannot be replayed into another
+ * flow/offset. */
+static size_t build_aad(const struct flowid *f, uint64_t seq, uint8_t *aad)
 {
     size_t n = 0;
     aad[n++] = 'A';
     memcpy(aad + n, f->canon, sizeof f->canon); n += sizeof f->canon;
     aad[n++] = f->dir;
-    put_be32(aad + n, seq); n += 4;
+    put_be32(aad + n, f->isn); n += 4;
+    put_be64(aad + n, seq); n += 8;
     return n;
 }
 
-int session_seal(struct session *s, const struct flowid *f, uint32_t seq,
+int session_seal(struct session *s, const struct flowid *f, uint64_t seq,
                  const uint8_t *pt, size_t len, uint8_t *ct, uint8_t tag[GCM_TAG_LEN])
 {
-    uint8_t nonce[GCM_NONCE_LEN], aad[1 + 12 + 1 + 4];
+    uint8_t nonce[GCM_NONCE_LEN], aad[AAD_LEN];
     if (derive_nonce(s, f, seq, (uint32_t)len, nonce) != 0)
         return -1;
     size_t aad_len = build_aad(f, seq, aad);
@@ -274,11 +303,11 @@ int session_seal(struct session *s, const struct flowid *f, uint32_t seq,
     return 0;
 }
 
-int session_open(struct session *s, const struct flowid *f, uint32_t seq,
+int session_open(struct session *s, const struct flowid *f, uint64_t seq,
                  const uint8_t *ct, size_t len, const uint8_t tag[GCM_TAG_LEN],
                  uint8_t *pt)
 {
-    uint8_t nonce[GCM_NONCE_LEN], aad[1 + 12 + 1 + 4], tag_copy[GCM_TAG_LEN];
+    uint8_t nonce[GCM_NONCE_LEN], aad[AAD_LEN], tag_copy[GCM_TAG_LEN];
     if (derive_nonce(s, f, seq, (uint32_t)len, nonce) != 0)
         return -1;
     size_t aad_len = build_aad(f, seq, aad);
