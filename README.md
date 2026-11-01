@@ -143,6 +143,91 @@ still arrives intact.
   traffic only; it is never forwarded to the PCs, and the data path carries no
   extra header.
 
+## Testing in Docker on macOS
+
+The lab depends on Linux network namespaces, veth pairs and `AF_PACKET` raw
+sockets, so it can't run directly on macOS. I tested it on a Mac inside an
+Ubuntu 24.04 container using Docker Desktop.
+
+### Start the container
+
+Run this from the project folder on the Mac:
+
+```bash
+docker run -it --name lab --privileged -v "$PWD":/lab -w /lab ubuntu:24.04 bash
+```
+
+- `--privileged` lets the container create namespaces and network interfaces.
+- `-v "$PWD":/lab` makes the project files available at `/lab`.
+- The container shell runs as root, so the commands below don't need `sudo`.
+
+### Build the lab
+
+Run these inside the container:
+
+```bash
+apt update
+apt install -y build-essential libssl-dev iproute2 ethtool tcpdump bc python3 openssl
+make
+./setup.sh
+openssl rand -hex 32 > psk.hex
+head -c 20M /dev/urandom > /tmp/file
+```
+
+### Run the transfer
+
+Each role needs its own terminal. Open each one from the Mac with:
+
+```bash
+docker exec -it -w /lab lab bash
+```
+
+Then run one command per terminal, in this order:
+
+```bash
+# Terminal 1: device 1
+ip netns exec d1 ./device d1-pc d1-net psk.hex
+# Terminal 2: device 2
+ip netns exec d2 ./device d2-pc d2-net psk.hex
+# Terminal 3: receiver on pc2
+ip netns exec pc2 ./receiver 5000 /tmp/out
+# Terminal 4: sender on pc1
+ip netns exec pc1 ./sender 10.20.20.2 5000 /tmp/file
+```
+
+When the transfer finishes, compare the two files:
+
+```bash
+sha256sum /tmp/file /tmp/out
+```
+
+### Run the wrong-PSK test
+
+This script builds its own lab, gives device 2 a different PSK, and removes the
+lab when it finishes:
+
+```bash
+WRONGKEY=1 ./run_test.sh
+```
+
+### Results
+
+**Handshake:** both devices established a secure session.
+
+![Device 1 establishes a secure session](docs/screenshots/01-device1-handshake.png)
+
+![Device 2 establishes a secure session](docs/screenshots/02-device2-handshake.png)
+
+**File transfer:** the sender sent 20,971,520 bytes (20 MiB), the receiver
+confirmed them, and the SHA-256 hashes of `/tmp/file` and `/tmp/out` match.
+
+![Sender output and matching SHA-256 hashes](docs/screenshots/03-transfer-sha256.png)
+
+**Wrong PSK:** device 2 reports a handshake confirmation mismatch and refuses to
+forward. Its `encrypted` and `decrypted` counters both stay at 0.
+
+![Docker Desktop logs showing the refused handshake](docs/screenshots/04-wrong-psk-refused.png)
+
 ## Tested in this build
 
 - 20 MB and 100 MB transfers: SHA-256 identical, 0 drops (~1 s for 100 MB).
