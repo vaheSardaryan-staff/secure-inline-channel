@@ -7,7 +7,7 @@ only thing added on the wire is the 16-byte GCM tag.
 
 ```
 pc1 ----- d1 ----- mitm(bridge) ----- d2 ----- pc2
-10.0.0.1  encrypt   can't read        decrypt   10.0.0.2
+10.10.10.1  encrypt   can't read        decrypt   10.20.20.2
 ./sender  payload   or alter it       payload   ./receiver
           (no IP)                     (no IP)
 ```
@@ -105,7 +105,7 @@ sudo ip netns exec mitm tcpdump -ni m-d1 -X 'tcp port 5000'
 # T4  PC2
 sudo ip netns exec pc2 ./receiver 5000 out
 # T5  PC1
-sudo ip netns exec pc1 ./sender 10.0.0.2 5000 file
+sudo ip netns exec pc1 ./sender 10.20.20.2 5000 file
 
 sha256sum file out               # identical
 ```
