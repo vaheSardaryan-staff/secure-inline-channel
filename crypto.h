@@ -14,12 +14,15 @@
  *   from fields they already see in the packet, so every packet still gets a
  *   unique nonce without spending a single extra byte on the wire.
  *
- *     nonce = HMAC-SHA256(nonce_master, "N" | flow | seq | len)[0..12]
- *     aad   =               "A" | flow | seq           (authenticated headers)
+ *     nonce = HMAC-SHA256(nonce_master, "N" | flow | isn | seq64 | len)[0..12]
+ *     aad   =               "A" | flow | isn | seq64   (authenticated headers)
  *
  *   "flow" is the connection's 4-tuple in a canonical order plus a direction
- *   bit, identical on both devices. Two different plaintexts can never share
- *   the same (flow, seq, len), so the nonce never repeats within a session.
+ *   bit, identical on both devices. "isn" is that direction's initial sequence
+ *   number, which separates connections reusing a 4-tuple. "seq64" is the TCP
+ *   sequence number extended to 64 bits, so it does not repeat when the 32-bit
+ *   field wraps. A TCP retransmission repeats the nonce with identical bytes,
+ *   and so produces the identical packet.
  */
 #ifndef CRYPTO_H
 #define CRYPTO_H
@@ -40,6 +43,7 @@
 struct flowid {
     uint8_t canon[12];   /* lo_ip|lo_port|hi_ip|hi_port, network order */
     uint8_t dir;         /* 0 = lo->hi, 1 = hi->lo */
+    uint32_t isn;        /* initial sequence number of this direction */
 };
 
 /* Our ephemeral DH key for one run. */
@@ -75,14 +79,19 @@ void session_free(struct session *s);
 
 /* Encrypt len plaintext bytes in place-safe buffers; writes ciphertext (len
  * bytes) and the 16-byte tag. Returns 0 on success. */
-int  session_seal(struct session *s, const struct flowid *f, uint32_t seq,
+int  session_seal(struct session *s, const struct flowid *f, uint64_t seq,
                   const uint8_t *pt, size_t len, uint8_t *ct, uint8_t tag[GCM_TAG_LEN]);
 
 /* Verify the tag and decrypt. Returns 0 on success, -1 if authentication
  * fails (tampered, wrong key, or replay into the wrong position). */
-int  session_open(struct session *s, const struct flowid *f, uint32_t seq,
+int  session_open(struct session *s, const struct flowid *f, uint64_t seq,
                   const uint8_t *ct, size_t len, const uint8_t tag[GCM_TAG_LEN],
                   uint8_t *pt);
+
+/* Extend a 32-bit TCP sequence number to 64 bits: the value closest to high,
+ * the largest extended sequence seen so far. Tolerates reordering of up to
+ * 2 GiB, so both devices agree even if packets arrive out of order. */
+uint64_t seq_extend(uint64_t high, uint32_t seq);
 
 /* Load a 64-hex-char PSK from a file into psk[32]. Returns 0 on success. */
 int  load_psk(const char *path, uint8_t psk[PSK_LEN]);

@@ -73,6 +73,8 @@
 #define BUF_SIZE         (MAX_FRAME + GCM_TAG_LEN)
 #define RX_BUDGET        256
 #define MSS_HEADROOM     76       /* 20 IP + max 40 TCP options + 16 tag */
+#define FLOW_BUCKETS     1024
+#define FLOW_WAYS        4
 
 /* ---- state ------------------------------------------------------------- */
 struct port {
@@ -86,7 +88,7 @@ struct port {
 struct stats {
     unsigned long encrypted, decrypted, passthrough;
     unsigned long fwd_p2c, fwd_c2p, mss_clamped;
-    unsigned long drop_not_ready, drop_auth_fail, drop_bad_format;
+    unsigned long drop_not_ready, drop_auth_fail, drop_bad_format, drop_no_flow;
     unsigned long drop_bad_csum, drop_oversize, drop_send_fail, drop_crypto_err;
 };
 
@@ -201,6 +203,63 @@ static void flow_of(const struct pkt *p, struct flowid *f)
     }
 }
 
+/* ---- per-flow sequence state ------------------------------------------- */
+/* Both devices learn each direction's ISN from its SYN and track the highest
+ * sequence seen, to extend the 32-bit field to 64 bits for the nonce. */
+struct flow_state {
+    uint8_t canon[12];
+    uint8_t dir;
+    uint8_t used;
+    uint32_t isn;
+    uint64_t high;
+    uint64_t last_used;
+};
+
+static struct flow_state g_flows[FLOW_BUCKETS * FLOW_WAYS];
+static uint64_t g_flow_tick;
+
+static struct flow_state *flow_bucket(const struct flowid *f)
+{
+    uint32_t h = 2166136261u;                 /* FNV-1a */
+    for (size_t i = 0; i < sizeof f->canon; i++)
+        h = (h ^ f->canon[i]) * 16777619u;
+    h = (h ^ f->dir) * 16777619u;
+    return &g_flows[(h % FLOW_BUCKETS) * FLOW_WAYS];
+}
+
+static struct flow_state *flow_find(const struct flowid *f)
+{
+    struct flow_state *b = flow_bucket(f);
+    for (int i = 0; i < FLOW_WAYS; i++)
+        if (b[i].used && b[i].dir == f->dir && memcmp(b[i].canon, f->canon, sizeof f->canon) == 0) {
+            b[i].last_used = ++g_flow_tick;
+            return &b[i];
+        }
+    return NULL;
+}
+
+/* A full bucket evicts its least recently used flow; that flow's later data is
+ * dropped as unknown. */
+static void flow_note_syn(const struct flowid *f, uint32_t isn)
+{
+    struct flow_state *e = flow_find(f);
+    if (e && e->isn == isn)
+        return;
+    if (!e) {
+        struct flow_state *b = flow_bucket(f);
+        e = &b[0];
+        for (int i = 1; i < FLOW_WAYS && e->used; i++)
+            if (!b[i].used || b[i].last_used < e->last_used)
+                e = &b[i];
+        memcpy(e->canon, f->canon, sizeof f->canon);
+        e->dir = f->dir;
+        e->used = 1;
+        e->last_used = ++g_flow_tick;
+    }
+    e->isn = isn;
+    e->high = (1ULL << 32) + isn;             /* offset: extension cannot underflow */
+}
+
 /* Lower the MSS option in SYN packets as a safety net. */
 static int clamp_mss(struct pkt *p, uint16_t max_mss)
 {
@@ -259,7 +318,7 @@ static void hs_derive_if_possible(struct device *d)
     if (session_derive(&d->hs, d->peer_pub, d->psk, &d->sess) != 0) {
         fprintf(stderr, "device: session derivation failed\n");
         session_free(&d->sess);
-        d->have_peer_pub = 0;            /* wait for a usable HELLO */
+        d->have_peer_pub = 0;
         return;
     }
     d->sess.ready = 0;   /* keys exist; forward only after the peer confirms */
@@ -341,12 +400,20 @@ static enum verdict do_encrypt(struct device *d, struct pkt *p)
         return DROP;
     }
     struct flowid f; flow_of(p, &f);
-    uint32_t seq = get32(p->tcp + 4);
+    struct flow_state *fs = flow_find(&f);
+    if (!fs) {
+        d->st.drop_no_flow++;
+        return DROP;
+    }
+    f.isn = fs->isn;
+    uint64_t seq = seq_extend(fs->high, get32(p->tcp + 4));
     uint8_t tag[GCM_TAG_LEN];
     if (session_seal(&d->sess, &f, seq, p->payload, p->plen, g_scratch, tag) != 0) {
         d->st.drop_crypto_err++;
         return DROP;
     }
+    if (seq > fs->high)
+        fs->high = seq;
     memcpy(p->payload, g_scratch, p->plen);
     memcpy(p->payload + p->plen, tag, GCM_TAG_LEN);
     p->plen += GCM_TAG_LEN;
@@ -364,13 +431,21 @@ static enum verdict do_decrypt(struct device *d, struct pkt *p)
     size_t clen = p->plen - GCM_TAG_LEN;
     const uint8_t *tag = p->payload + clen;
     struct flowid f; flow_of(p, &f);
-    uint32_t seq = get32(p->tcp + 4);
+    struct flow_state *fs = flow_find(&f);
+    if (!fs) {
+        d->st.drop_no_flow++;
+        return DROP;
+    }
+    f.isn = fs->isn;
+    uint64_t seq = seq_extend(fs->high, get32(p->tcp + 4));
     if (session_open(&d->sess, &f, seq, p->payload, clen, tag, g_scratch) != 0) {
         d->st.drop_auth_fail++;
         if (d->verbose)
             fprintf(stderr, "drop: authentication failed (tampered or wrong key)\n");
         return DROP;
     }
+    if (seq > fs->high)                       /* only authenticated data moves it */
+        fs->high = seq;
     memcpy(p->payload, g_scratch, clen);
     p->plen = clen;
     p->tot_len -= GCM_TAG_LEN;
@@ -383,7 +458,7 @@ static enum verdict process(struct device *d, uint8_t *frame, size_t *len, int f
     struct pkt p;
     int parsed = parse_ipv4_tcp(frame, *len, &p);
     if (parsed < 0) {
-        d->st.drop_bad_format++;              /* fragment or malformed TCP */
+        d->st.drop_bad_format++;
         return DROP;
     }
     if (parsed == 0) {
@@ -404,6 +479,11 @@ static enum verdict process(struct device *d, uint8_t *frame, size_t *len, int f
     if (!gcm_protected && !tcp_csum_ok(&p)) {
         d->st.drop_bad_csum++;
         return DROP;
+    }
+
+    if (p.tcp[13] & 0x02) {
+        struct flowid syn; flow_of(&p, &syn);
+        flow_note_syn(&syn, get32(p.tcp + 4));
     }
 
     int modified = 0;
@@ -564,13 +644,14 @@ static void print_stats(const struct device *d)
         "  dropped: session not up : %lu\n"
         "  dropped: auth failed    : %lu\n"
         "  dropped: bad format     : %lu\n"
+        "  dropped: unknown flow   : %lu\n"
         "  dropped: bad checksum   : %lu\n"
         "  dropped: too big        : %lu\n"
         "  dropped: send failed    : %lu\n"
         "  dropped: crypto error   : %lu\n",
         d->plain.name, d->cipher.name, s->fwd_p2c, s->fwd_c2p, s->encrypted, s->decrypted,
         s->passthrough, s->mss_clamped, s->drop_not_ready, s->drop_auth_fail,
-        s->drop_bad_format, s->drop_bad_csum, s->drop_oversize, s->drop_send_fail,
+        s->drop_bad_format, s->drop_no_flow, s->drop_bad_csum, s->drop_oversize, s->drop_send_fail,
         s->drop_crypto_err);
 }
 

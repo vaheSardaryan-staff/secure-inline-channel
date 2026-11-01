@@ -15,6 +15,7 @@
 #include <openssl/rand.h>
 
 #define DH_GROUP "ffdhe2048"
+#define AAD_LEN  (1 + 12 + 1 + 4 + 8)
 
 /* ---- small helpers ----------------------------------------------------- */
 static void put_be32(uint8_t *p, uint32_t v)
@@ -23,6 +24,12 @@ static void put_be32(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);
     p[3] = (uint8_t)v;
+}
+
+static void put_be64(uint8_t *p, uint64_t v)
+{
+    put_be32(p, (uint32_t)(v >> 32));
+    put_be32(p + 4, (uint32_t)v);
 }
 
 static EVP_MAC *g_hmac;   /* HMAC provider, fetched once */
@@ -236,17 +243,23 @@ void session_free(struct session *s)
 }
 
 /* ---- per-packet nonce and AAD ----------------------------------------- */
-/* nonce = HMAC(nonce_master, 'N' | flow | seq | len)[0..12]
- * Unique because (flow, seq, len) is unique to each distinct plaintext. */
-static int derive_nonce(struct session *s, const struct flowid *f,
-                        uint32_t seq, uint32_t len, uint8_t nonce[GCM_NONCE_LEN])
+uint64_t seq_extend(uint64_t high, uint32_t seq)
 {
-    uint8_t msg[1 + sizeof f->canon + 1 + 4 + 4];
+    int32_t delta = (int32_t)(seq - (uint32_t)high);
+    return high + (uint64_t)(int64_t)delta;
+}
+
+/* nonce = HMAC(nonce_master, 'N' | flow | isn | seq64 | len)[0..12] */
+static int derive_nonce(struct session *s, const struct flowid *f,
+                        uint64_t seq, uint32_t len, uint8_t nonce[GCM_NONCE_LEN])
+{
+    uint8_t msg[1 + sizeof f->canon + 1 + 4 + 8 + 4];
     size_t n = 0;
     msg[n++] = 'N';
     memcpy(msg + n, f->canon, sizeof f->canon); n += sizeof f->canon;
     msg[n++] = f->dir;
-    put_be32(msg + n, seq); n += 4;
+    put_be32(msg + n, f->isn); n += 4;
+    put_be64(msg + n, seq); n += 8;
     put_be32(msg + n, len); n += 4;
 
     uint8_t full[32];
@@ -256,22 +269,24 @@ static int derive_nonce(struct session *s, const struct flowid *f,
     return 0;
 }
 
-/* aad = 'A' | flow | seq : binds the ciphertext to its connection and stream
- * position, so a valid payload cannot be replayed into another flow/offset. */
-static size_t build_aad(const struct flowid *f, uint32_t seq, uint8_t *aad)
+/* aad = 'A' | flow | isn | seq64 : binds the ciphertext to its connection and
+ * stream position, so a valid payload cannot be replayed into another
+ * flow/offset. */
+static size_t build_aad(const struct flowid *f, uint64_t seq, uint8_t *aad)
 {
     size_t n = 0;
     aad[n++] = 'A';
     memcpy(aad + n, f->canon, sizeof f->canon); n += sizeof f->canon;
     aad[n++] = f->dir;
-    put_be32(aad + n, seq); n += 4;
+    put_be32(aad + n, f->isn); n += 4;
+    put_be64(aad + n, seq); n += 8;
     return n;
 }
 
-int session_seal(struct session *s, const struct flowid *f, uint32_t seq,
+int session_seal(struct session *s, const struct flowid *f, uint64_t seq,
                  const uint8_t *pt, size_t len, uint8_t *ct, uint8_t tag[GCM_TAG_LEN])
 {
-    uint8_t nonce[GCM_NONCE_LEN], aad[1 + 12 + 1 + 4];
+    uint8_t nonce[GCM_NONCE_LEN], aad[AAD_LEN];
     if (derive_nonce(s, f, seq, (uint32_t)len, nonce) != 0)
         return -1;
     size_t aad_len = build_aad(f, seq, aad);
@@ -288,11 +303,11 @@ int session_seal(struct session *s, const struct flowid *f, uint32_t seq,
     return 0;
 }
 
-int session_open(struct session *s, const struct flowid *f, uint32_t seq,
+int session_open(struct session *s, const struct flowid *f, uint64_t seq,
                  const uint8_t *ct, size_t len, const uint8_t tag[GCM_TAG_LEN],
                  uint8_t *pt)
 {
-    uint8_t nonce[GCM_NONCE_LEN], aad[1 + 12 + 1 + 4], tag_copy[GCM_TAG_LEN];
+    uint8_t nonce[GCM_NONCE_LEN], aad[AAD_LEN], tag_copy[GCM_TAG_LEN];
     if (derive_nonce(s, f, seq, (uint32_t)len, nonce) != 0)
         return -1;
     size_t aad_len = build_aad(f, seq, aad);
