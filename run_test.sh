@@ -58,7 +58,7 @@ if [[ "$WRONGKEY" == 1 ]]; then
     echo "Handshake correctly refused. Confirming the data path stays blocked..."
     ip netns exec pc2 timeout 6 ./receiver "$PORT" "$WORK/out" >/dev/null 2>&1 & R=$!
     sleep 0.3
-    if timeout 5 ip netns exec pc1 ./sender 10.0.0.2 "$PORT" "$WORK/file" >/dev/null 2>&1; then
+    if timeout 5 ip netns exec pc1 ./sender 10.20.20.2 "$PORT" "$WORK/file" >/dev/null 2>&1; then
         echo "FAIL: transfer succeeded with no session" >&2; kill $R 2>/dev/null; exit 1
     fi
     kill $R 2>/dev/null || true
@@ -75,7 +75,7 @@ for _ in $(seq 50); do
 done
 
 start=$(date +%s.%N)
-ip netns exec pc1 ./sender 10.0.0.2 "$PORT" "$WORK/file"
+ip netns exec pc1 ./sender 10.20.20.2 "$PORT" "$WORK/file"
 wait "$RECV"
 end=$(date +%s.%N)
 

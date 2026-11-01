@@ -2,12 +2,13 @@
 # Builds the lab as a transparent bump-in-the-wire:
 #
 #   pc1 --- d1 --- mitm(bridge) --- d2 --- pc2
-#  10.0.0.1  (no IP)   (no IP)    (no IP)  10.0.0.2
+#  10.10.10.1 (no IP)  (no IP)    (no IP)  10.20.20.2
 #
-# The two PCs are on ONE subnet. Device1 and Device2 have no IP and sit inline;
-# the MITM is a plain L2 bridge that forwards every frame (so it can also be
-# used to try tampering). Nothing but ARP passes until ./device completes its
-# Diffie-Hellman handshake in both d1 and d2.
+# The PCs are on different subnets but on one L2 segment, so each has an on-link
+# route and a fixed ARP entry for the other. Device1 and Device2 have no IP and
+# sit inline; the MITM is a plain L2 bridge that forwards every frame (so it can
+# also be used to try tampering). No IPv4 TCP passes until ./device completes
+# its Diffie-Hellman handshake in both d1 and d2.
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "setup.sh: run as root (sudo ./setup.sh)" >&2; exit 1; }
@@ -57,17 +58,17 @@ ip -n mitm link set br0 mtu "$MTU"
 ip -n mitm link set m-d1 master br0
 ip -n mitm link set m-d2 master br0
 ip -n mitm link set br0 up
-# Forward even "reserved" group frames so our handshake EtherType passes.
-echo 0xffff > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
 
-# PCs: one subnet, no router.
-ip -n pc1 addr add 10.0.0.1/24 dev pc1-eth
-ip -n pc2 addr add 10.0.0.2/24 dev pc2-eth
+# PCs: two subnets, no router, so the peer is reached through an on-link route.
+ip -n pc1 addr add 10.10.10.1/24 dev pc1-eth
+ip -n pc2 addr add 10.20.20.2/24 dev pc2-eth
+ip -n pc1 route add 10.20.20.2/32 dev pc1-eth
+ip -n pc2 route add 10.10.10.1/32 dev pc2-eth
 # Fixed ARP so the demo never waits on resolution (optional but tidy).
 M1=$(ip -n pc1 link show pc1-eth | awk '/link\/ether/{print $2}')
 M2=$(ip -n pc2 link show pc2-eth | awk '/link\/ether/{print $2}')
-ip -n pc1 neigh replace 10.0.0.2 lladdr "$M2" dev pc1-eth
-ip -n pc2 neigh replace 10.0.0.1 lladdr "$M1" dev pc2-eth
+ip -n pc1 neigh replace 10.20.20.2 lladdr "$M2" dev pc1-eth
+ip -n pc2 neigh replace 10.10.10.1 lladdr "$M1" dev pc2-eth
 
-echo "Lab ready: pc1(10.0.0.1) - d1 - mitm(bridge) - d2 - pc2(10.0.0.2)"
+echo "Lab ready: pc1(10.10.10.1) - d1 - mitm(bridge) - d2 - pc2(10.20.20.2)"
 echo "TCP flows only after ./device finishes the DH handshake in d1 and d2."
